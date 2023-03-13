@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -61,7 +62,7 @@ func run() error {
 	h := c.Then(http.HandlerFunc(handleSourceGo))
 	http.Handle("/source/go", h)
 
-	if err := http.ListenAndServe(":8090", nil); err != nil {
+	if err := http.ListenAndServe(flags.ListenPort, nil); err != nil {
 		return err
 	}
 
@@ -82,7 +83,45 @@ func goEnv() []string {
 
 }
 
-func writeSourceGo(ctx context.Context, repo, revision, sourcePath string, w io.Writer) error {
+func writeStdLibGo(ctx context.Context, sourcePath string, w io.Writer) error {
+	goRoot, err := exec.Command("go", "env", "GOROOT").Output()
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(filepath.Join(strings.TrimSpace(string(goRoot)), "src", sourcePath))
+
+	f, err := os.Open(filepath.Join(strings.TrimSpace(string(goRoot)), "src", sourcePath))
+	defer f.Close()
+
+	if _, err := io.Copy(w, f); err != nil {
+		return err
+	}
+
+	return nil
+
+}
+
+func writeSourceGo(ctx context.Context, functionName, revision, sourcePath string, w io.Writer) error {
+	// find the left most part and remove function name
+	functionParts := strings.Split(functionName, "/")
+
+	posDot := strings.Index(functionParts[len(functionParts)-1], ".")
+	if posDot >= 0 {
+		functionParts[len(functionParts)-1] = functionParts[len(functionParts)-1][:posDot]
+	}
+
+	// if the first part doesn't contain a . then it is the standard libary
+	if !strings.Contains(functionParts[0], ".") {
+		pos := strings.LastIndex(sourcePath, functionParts[0])
+		if pos < 0 {
+			return errors.New("unable to find stdlib package in path")
+		}
+
+		return writeStdLibGo(ctx, sourcePath[pos:], w)
+	}
+
+	repo := strings.Join(functionParts[0:3], "/")
 
 	// handle if the source path is a go mod dependency
 	pkgModPath := "/pkg/mod/"
@@ -186,13 +225,13 @@ func writeSourceGo(ctx context.Context, repo, revision, sourcePath string, w io.
 func handleSourceGo(w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()
 	var (
-		repo     = q.Get("repo")
+		function = q.Get("function")
 		revision = q.Get("revision")
 		path     = q.Get("path")
 	)
 
-	if repo == "" {
-		http.Error(w, "missing repo", http.StatusBadRequest)
+	if function == "" {
+		http.Error(w, "missing function", http.StatusBadRequest)
 		return
 	}
 
@@ -205,7 +244,7 @@ func handleSourceGo(w http.ResponseWriter, req *http.Request) {
 		revision = "latest"
 	}
 
-	if err := writeSourceGo(req.Context(), repo, revision, path, w); err != nil {
+	if err := writeSourceGo(req.Context(), function, revision, path, w); err != nil {
 		http.Error(w, "error receiving source code", http.StatusInternalServerError)
 		hlog.FromRequest(req).Error().Err(err).Msg("error receiving source code")
 		return
