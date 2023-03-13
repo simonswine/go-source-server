@@ -210,8 +210,6 @@ func handleSourceGo(w http.ResponseWriter, req *http.Request) {
 		hlog.FromRequest(req).Error().Err(err).Msg("error receiving source code")
 		return
 	}
-
-	fmt.Fprintf(w, "hello\n")
 }
 
 func main() {
