@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
@@ -80,7 +79,92 @@ func goEnv() []string {
 		"GOCACHE=" + filepath.Join(cacheDir, "go-cache"),
 		"GOMODCACHE=" + filepath.Join(cacheDir, "go-mod-cache"),
 	}
+}
 
+type SourceSpec struct {
+	Repo         string
+	RelativePath string
+	Revision     string
+}
+
+func (s *SourceSpec) writeContent(ctx context.Context, revision string, w io.Writer) error {
+	if s.Repo == "" {
+		return writeStdLibGo(ctx, s.RelativePath, w)
+	}
+
+	// if source spec has an empty revision take the on from the user, if that is empty too, use latest
+	rev := s.Revision
+	if rev == "" {
+		rev = revision
+	}
+	if rev == "" {
+		rev = "latest"
+	}
+
+	return writeSourceGo(ctx, s.Repo, rev, s.RelativePath, w)
+
+}
+
+func resolveImportPath(function string, path string) (*SourceSpec, error) {
+	var (
+		spec      SourceSpec
+		pathParts = strings.Split(path, "/")
+	)
+
+	// check if there is a go mod version specifier (using @) in the path
+	for idx := range pathParts {
+		if pos := strings.LastIndex(pathParts[idx], "@"); pos >= 0 {
+			spec.Revision = pathParts[idx][pos+1:]
+			pathParts[idx] = pathParts[idx][:pos]
+
+			// if we got a relative file path we have all information now
+			spec.RelativePath = strings.Join(pathParts[idx+1:], "/")
+			if !strings.HasPrefix(path, "/") {
+				spec.Repo = strings.Join(pathParts[:idx+1], "/")
+				return &spec, nil
+			}
+
+			//pathParts = pathParts[idx+1:]
+			break
+		}
+	}
+
+	if function == "" {
+		return nil, errors.New("function is empty and couldn't be determined, as this is only possible when a relative path is used with a go.mod version specification")
+	}
+
+	functionParts := strings.Split(function, "/")
+
+	// find the left most part and remove function name
+	// strip of function name from import path
+	posDot := strings.Index(functionParts[len(functionParts)-1], ".")
+	if posDot >= 0 {
+		functionParts[len(functionParts)-1] = functionParts[len(functionParts)-1][:posDot]
+	}
+
+	// if the first part doesn't contain a . then it is the standard libary
+	if !strings.Contains(functionParts[0], ".") {
+		pos := strings.LastIndex(path, functionParts[0])
+		if pos >= 0 {
+			return &SourceSpec{RelativePath: path[pos:]}, nil
+		}
+	}
+
+	// when the first elemet is "github.com", expect two more to form repo
+	if spec.Repo == "" {
+		if len(functionParts) >= 3 {
+			spec.Repo = strings.Join(functionParts[:3], "/")
+			functionParts = functionParts[3:]
+		}
+	}
+
+	// when relative path not populated take the package path length from path
+	if spec.RelativePath == "" {
+		startIndex := len(pathParts) - len(functionParts) - 1
+		spec.RelativePath = strings.Join(pathParts[startIndex:], "/")
+	}
+
+	return &spec, nil
 }
 
 func writeStdLibGo(ctx context.Context, sourcePath string, w io.Writer) error {
@@ -102,48 +186,7 @@ func writeStdLibGo(ctx context.Context, sourcePath string, w io.Writer) error {
 
 }
 
-func writeSourceGo(ctx context.Context, functionName, revision, sourcePath string, w io.Writer) error {
-	// find the left most part and remove function name
-	functionParts := strings.Split(functionName, "/")
-
-	posDot := strings.Index(functionParts[len(functionParts)-1], ".")
-	if posDot >= 0 {
-		functionParts[len(functionParts)-1] = functionParts[len(functionParts)-1][:posDot]
-	}
-
-	// if the first part doesn't contain a . then it is the standard libary
-	if !strings.Contains(functionParts[0], ".") {
-		pos := strings.LastIndex(sourcePath, functionParts[0])
-		if pos < 0 {
-			return errors.New("unable to find stdlib package in path")
-		}
-
-		return writeStdLibGo(ctx, sourcePath[pos:], w)
-	}
-
-	repo := strings.Join(functionParts[0:3], "/")
-
-	// handle if the source path is a go mod dependency
-	pkgModPath := "/pkg/mod/"
-	if i := strings.Index(sourcePath, pkgModPath); i > 0 {
-		depPath := sourcePath[len(pkgModPath)+i:]
-
-		posAt := strings.Index(depPath, "@")
-		if posAt > 0 {
-			posEnd := posAt + strings.Index(depPath[posAt:], "/")
-			if posEnd > 0 {
-				module := depPath[:posAt]
-				revision := depPath[posAt+1 : posEnd]
-				log.Ctx(ctx).Info().
-					Str("module", module).
-					Str("revision", revision).
-					Msg("this is acutally for a dependecy source code")
-
-				return writeSourceGo(ctx, module, revision, depPath[posEnd:], w)
-			}
-		}
-	}
-
+func writeSourceGo(ctx context.Context, repo, revision, path string, w io.Writer) error {
 	cmd := []string{"go", "mod", "download", "-json", repo + "@" + revision}
 	log.Ctx(ctx).Info().
 		Strs("cmd", cmd).
@@ -183,33 +226,7 @@ func writeSourceGo(ctx context.Context, functionName, revision, sourcePath strin
 		Str("version", goModInfo.Version).
 		Msg("found go module")
 
-	// now find the file with longest prefix match (only works for files within repo)
-	foundFile := ""
-	prefixLen := len(goModInfo.Dir)
-	if err := filepath.WalkDir(goModInfo.Dir, func(path string, d fs.DirEntry, err error) error {
-		if d.IsDir() {
-			return nil
-		}
-
-		relPath := path[prefixLen+1:]
-
-		if strings.HasSuffix(sourcePath, relPath) {
-			fmt.Println("found", relPath)
-			if len(foundFile) < len(relPath) {
-				foundFile = relPath
-			}
-		}
-
-		return nil
-	}); err != nil {
-		return err
-	}
-
-	if foundFile == "" {
-		return io.EOF
-	}
-
-	f, err := os.Open(filepath.Join(goModInfo.Dir, foundFile))
+	f, err := os.Open(filepath.Join(goModInfo.Dir, path))
 	if err != nil {
 		return err
 	}
@@ -230,11 +247,6 @@ func handleSourceGo(w http.ResponseWriter, req *http.Request) {
 		path     = q.Get("path")
 	)
 
-	if function == "" {
-		http.Error(w, "missing function", http.StatusBadRequest)
-		return
-	}
-
 	if path == "" {
 		http.Error(w, "missing path", http.StatusBadRequest)
 		return
@@ -244,9 +256,16 @@ func handleSourceGo(w http.ResponseWriter, req *http.Request) {
 		revision = "latest"
 	}
 
-	if err := writeSourceGo(req.Context(), function, revision, path, w); err != nil {
-		http.Error(w, "error receiving source code", http.StatusInternalServerError)
-		hlog.FromRequest(req).Error().Err(err).Msg("error receiving source code")
+	spec, err := resolveImportPath(function, path)
+	if err != nil {
+		http.Error(w, "error resolving import path", http.StatusInternalServerError)
+		hlog.FromRequest(req).Error().Err(err).Msg("error resolving import path")
+		return
+	}
+
+	if err := spec.writeContent(req.Context(), revision, w); err != nil {
+		http.Error(w, "error retrieving source code", http.StatusInternalServerError)
+		hlog.FromRequest(req).Error().Err(err).Msg("error retrieving source code")
 		return
 	}
 }
