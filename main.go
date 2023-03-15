@@ -98,7 +98,7 @@ func (s *SourceSpec) writeContent(ctx context.Context, revision string, w io.Wri
 		rev = revision
 	}
 	if rev == "" {
-		rev = "latest"
+		rev = "HEAD"
 	}
 
 	return writeSourceGo(ctx, s.Repo, rev, s.RelativePath, w)
